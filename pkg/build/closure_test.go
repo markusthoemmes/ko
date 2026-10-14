@@ -27,10 +27,8 @@ import (
 
 const closureAppImportPath = "example.com/app"
 
-// newClosureRepo creates a repository holding an app module that imports a
-// package from a lib module it replaces with a local directory, and returns
-// the repository root and the app directory. Nothing is committed yet.
-func newClosureRepo(t *testing.T) (string, string) {
+// newRepo creates a git repository holding files, with nothing committed.
+func newRepo(t *testing.T, files map[string]string) string {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
@@ -40,7 +38,19 @@ func newClosureRepo(t *testing.T) (string, string) {
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 
 	root := t.TempDir()
-	for name, content := range map[string]string{
+	for name, content := range files {
+		writeRepoFile(t, root, name, content)
+	}
+	mustGit(t, root, "init", "-q")
+	return root
+}
+
+// newClosureRepo creates a repository holding an app module that imports a
+// package from a lib module it replaces with a local directory, and returns
+// the repository root and the app directory.
+func newClosureRepo(t *testing.T) (string, string) {
+	t.Helper()
+	root := newRepo(t, map[string]string{
 		"unrelated.txt":           "unrelated\n",
 		"app/go.mod":              "module example.com/app\n\ngo 1.22\n\nrequire example.com/lib v0.0.0\n\nreplace example.com/lib => ../lib\n",
 		"app/main.go":             "package main\n\nimport \"example.com/lib\"\n\nfunc main() { lib.Hello() }\n",
@@ -48,10 +58,7 @@ func newClosureRepo(t *testing.T) (string, string) {
 		"lib/go.mod":              "module example.com/lib\n\ngo 1.22\n",
 		"lib/lib.go":              "package lib\n\nfunc Hello() {}\n",
 		"lib/other/other.go":      "package other\n",
-	} {
-		writeRepoFile(t, root, name, content)
-	}
-	mustGit(t, root, "init", "-q")
+	})
 	return root, filepath.Join(root, "app")
 }
 
@@ -148,6 +155,30 @@ func TestResolveClosureFollowsInputs(t *testing.T) {
 				t.Errorf("closure commit: got = %s, want = %s", got, want)
 			}
 		})
+	}
+}
+
+func TestClosureOfPackageAtRepositoryRoot(t *testing.T) {
+	root := newRepo(t, map[string]string{
+		"go.mod":  "module example.com/app\n\ngo 1.22\n",
+		"main.go": "package main\n\nfunc main() {}\n",
+	})
+	commitAll(t, root, "initial")
+	writeRepoFile(t, root, "main.go", "package main\n\nfunc main() { println() }\n")
+	want := commitAll(t, root, "change main.go")
+
+	repo, in := closureFor(t, root)
+	got, err := repo.lastCommit(t.Context(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("closure commit: got = %s, want = %s", got, want)
+	}
+
+	writeRepoFile(t, root, "extra.go", "package main\n")
+	if dirty, err := repo.firstChanged(t.Context(), in); err != nil || dirty == "" {
+		t.Errorf("firstChanged with an untracked root file: got = %q, %v, want a change", dirty, err)
 	}
 }
 
@@ -297,7 +328,7 @@ func TestKodataFilesFollowsSymlinksWithinRepository(t *testing.T) {
 	}
 	defer root.Close()
 
-	got, err := repository{dir: dir, root: root}.kodataFiles("app/kodata")
+	got, err := repository{dir: dir, root: root, fsys: root.FS()}.kodataFiles("app/kodata")
 	if err != nil {
 		t.Fatal(err)
 	}

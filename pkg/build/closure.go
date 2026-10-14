@@ -90,7 +90,7 @@ func (g *gobuild) closureBuildDir(ctx context.Context, ip string, env, flags []s
 	}
 	log.Printf("Building %s from %s, the last commit that changed its inputs", ip, commit[:12])
 	rel, _ := repo.rel(dir)
-	return filepath.Join(checkout, rel), cleanup, nil
+	return filepath.Join(checkout, filepath.FromSlash(rel)), cleanup, nil
 }
 
 // resolvedDir returns dir as an absolute path with symlinks resolved, the way
@@ -103,12 +103,14 @@ func resolvedDir(dir string) (string, error) {
 	return filepath.EvalSymlinks(abs)
 }
 
-// repository is the git repository a binary is built from. Files are read
-// through root, so paths taken from module files and symlinks cannot reach
-// outside the repository.
+// repository is the git repository a binary is built from. Inside it, paths
+// are relative to the repository root and in slash form, which is what git
+// pathspecs and fsys both take. Files are read through an os.Root, so paths
+// taken from module files and symlinks cannot reach outside the repository.
 type repository struct {
 	dir  string
 	root *os.Root
+	fsys fs.FS
 }
 
 func openRepo(ctx context.Context, dir string) (repository, error) {
@@ -124,21 +126,18 @@ func openRepo(ctx context.Context, dir string) (repository, error) {
 	if err != nil {
 		return repository{}, err
 	}
-	return repository{dir: top, root: root}, nil
+	return repository{dir: top, root: root, fsys: root.FS()}, nil
 }
 
 func (r repository) Close() error {
 	return r.root.Close()
 }
 
-// rel returns p relative to the repository root in slash form, and whether p
-// lies within the repository at all.
+// rel converts the absolute path p, as the go command reports it, to a
+// repository path, and reports whether p lies within the repository at all.
 func (r repository) rel(p string) (string, bool) {
-	if !withinRoot(p, r.dir) {
-		return "", false
-	}
 	rel, err := filepath.Rel(r.dir, p)
-	if err != nil {
+	if err != nil || !filepath.IsLocal(rel) {
 		return "", false
 	}
 	return filepath.ToSlash(rel), true
@@ -263,7 +262,9 @@ type inputs struct {
 func (in inputs) pathspecs() []string {
 	specs := make([]string, 0, len(in.dirs)+len(in.files))
 	for _, d := range in.dirs {
-		specs = append(specs, ":(top,glob)"+globEscaper.Replace(d)+"/*")
+		// A package at the repository root has the directory ".", and
+		// "./*" would match nothing, so join rather than concatenate.
+		specs = append(specs, ":(top,glob)"+path.Join(globEscaper.Replace(d), "*"))
 	}
 	for _, f := range in.files {
 		specs = append(specs, ":(top,literal)"+f)
@@ -401,7 +402,7 @@ func (r repository) moduleFiles(ctx context.Context, dir string, env []string, m
 	for _, f := range files {
 		// Not every module has a go.sum.
 		if rel, ok := r.rel(f); ok {
-			if _, err := r.root.Stat(filepath.FromSlash(rel)); err == nil {
+			if _, err := fs.Stat(r.fsys, rel); err == nil {
 				rels = append(rels, rel)
 			}
 		}
@@ -416,7 +417,7 @@ func (r repository) readFile(p string) ([]byte, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
-	data, err := r.root.ReadFile(filepath.FromSlash(rel))
+	data, err := fs.ReadFile(r.fsys, rel)
 	return data, true, err
 }
 
@@ -446,7 +447,7 @@ func resolvePath(base, p string) string {
 // inputs, and ko rejects them when it builds the image anyway.
 func (r repository) kodataFiles(dir string) ([]string, error) {
 	var files []string
-	err := fs.WalkDir(r.root.FS(), dir, func(p string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(r.fsys, dir, func(p string, d fs.DirEntry, err error) error {
 		switch {
 		case errors.Is(err, fs.ErrNotExist) && p == dir:
 			return nil // There is no kodata.
@@ -458,7 +459,7 @@ func (r repository) kodataFiles(dir string) ([]string, error) {
 		if err != nil || target == "" {
 			return err
 		}
-		info, err := r.root.Stat(filepath.FromSlash(target))
+		info, err := fs.Stat(r.fsys, target)
 		if err != nil {
 			return err
 		}
@@ -482,12 +483,12 @@ func (r repository) kodataFiles(dir string) ([]string, error) {
 func (r repository) followLinks(p string) (string, []string, error) {
 	var links []string
 	for range 40 { // POSIX guarantees at least this many levels.
-		info, err := r.root.Lstat(filepath.FromSlash(p))
+		info, err := fs.Lstat(r.fsys, p)
 		if err != nil || info.Mode()&fs.ModeSymlink == 0 {
 			return p, links, err
 		}
 		links = append(links, p)
-		target, err := r.root.Readlink(filepath.FromSlash(p))
+		target, err := fs.ReadLink(r.fsys, p)
 		if err != nil {
 			return "", links, err
 		}
