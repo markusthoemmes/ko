@@ -47,7 +47,8 @@ func newRepo(t *testing.T, files map[string]string) string {
 
 // newClosureRepo creates a repository holding an app module that imports a
 // package from a lib module it replaces with a local directory, and returns
-// the repository root and the app directory.
+// the repository root and the app directory. The app module also holds a
+// Terraform module, the kind of working directory the ko provider builds from.
 func newClosureRepo(t *testing.T) (string, string) {
 	t.Helper()
 	root := newRepo(t, map[string]string{
@@ -55,6 +56,7 @@ func newClosureRepo(t *testing.T) (string, string) {
 		"app/go.mod":              "module example.com/app\n\ngo 1.22\n\nrequire example.com/lib v0.0.0\n\nreplace example.com/lib => ../lib\n",
 		"app/main.go":             "package main\n\nimport \"example.com/lib\"\n\nfunc main() { lib.Hello() }\n",
 		"app/kodata/greeting.txt": "hello\n",
+		"app/iac/main.tf":         "# Terraform that builds the app\n",
 		"lib/go.mod":              "module example.com/lib\n\ngo 1.22\n",
 		"lib/lib.go":              "package lib\n\nfunc Hello() {}\n",
 		"lib/other/other.go":      "package other\n",
@@ -188,7 +190,8 @@ func TestClosureCheckoutBuildsStableStampedBinary(t *testing.T) {
 
 	build := func() []byte {
 		t.Helper()
-		g := &gobuild{dir: app}
+		// Build from a directory that holds no input, as the ko provider does.
+		g := &gobuild{dir: filepath.Join(app, "iac")}
 		dir, cleanup, err := g.closureBuildDir(t.Context(), closureAppImportPath, closureTestEnv(), nil)
 		if err != nil {
 			t.Fatal(err)

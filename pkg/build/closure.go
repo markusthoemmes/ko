@@ -88,9 +88,16 @@ func (g *gobuild) closureBuildDir(ctx context.Context, ip string, env, flags []s
 	if err != nil {
 		return "", nil, err
 	}
-	log.Printf("Building %s from %s, the last commit that changed its inputs", ip, commit[:12])
+	// The working directory, such as a Terraform module next to the Go code,
+	// need not hold any input, so the checkout may lack it.
 	rel, _ := repo.rel(dir)
-	return filepath.Join(checkout, filepath.FromSlash(rel)), cleanup, nil
+	buildDir := filepath.Join(checkout, filepath.FromSlash(rel))
+	if err := os.MkdirAll(buildDir, 0o755); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	log.Printf("Building %s from %s, the last commit that changed its inputs", ip, commit[:12])
+	return buildDir, cleanup, nil
 }
 
 // resolvedDir returns dir as an absolute path with symlinks resolved, the way
@@ -297,17 +304,17 @@ func listInputs(ctx context.Context, repo repository, dir, ip string, env, flags
 		}
 	})
 
-	mainDir, ok := repo.rel(main.Dir)
-	if !ok || main.Module == nil {
-		return inputs{}, fmt.Errorf("%s is not a package of a module in %s", ip, repo.dir)
-	}
-	modFiles, err := repo.moduleFiles(ctx, dir, env, main.Module.GoMod)
+	modFiles, err := repo.moduleFiles(ctx, dir, env)
 	if err != nil {
 		return inputs{}, err
 	}
-	kodata, err := repo.kodataFiles(path.Join(mainDir, "kodata"))
-	if err != nil {
-		return inputs{}, err
+	// A main package from a dependency module brings its kodata from the
+	// module cache, pinned by go.sum.
+	var kodata []string
+	if mainDir, ok := repo.rel(main.Dir); ok {
+		if kodata, err = repo.kodataFiles(path.Join(mainDir, "kodata")); err != nil {
+			return inputs{}, err
+		}
 	}
 	for _, f := range slices.Concat(modFiles, kodata) {
 		files[f] = struct{}{}
@@ -354,16 +361,20 @@ func loadPackage(ctx context.Context, dir, ip string, env, flags []string) (*pac
 // and the used modules' go.mod and go.sum in workspace mode, and the go.mod of
 // every local replacement, which go reads even when the build imports none of
 // its packages. Files outside the repository cannot be inputs.
-func (r repository) moduleFiles(ctx context.Context, dir string, env []string, mainGoMod string) ([]string, error) {
-	goMods := []string{mainGoMod}
-	var files []string
-
-	// The go command decides whether, and which, workspace applies.
-	out, err := runGo(ctx, dir, env, "env", "GOWORK")
+func (r repository) moduleFiles(ctx context.Context, dir string, env []string) ([]string, error) {
+	// The go command decides which module is the main one, and whether, and
+	// which, workspace applies.
+	out, err := runGo(ctx, dir, env, "env", "GOMOD", "GOWORK")
 	if err != nil {
 		return nil, err
 	}
-	if goWork := strings.TrimSpace(out); goWork != "" && goWork != "off" {
+	// One line per variable; either may be empty.
+	mainGoMod, goWork, _ := strings.Cut(strings.TrimSuffix(out, "\n"), "\n")
+	var goMods, files []string
+	if mainGoMod != "" && mainGoMod != os.DevNull {
+		goMods = append(goMods, mainGoMod)
+	}
+	if goWork != "" && goWork != "off" {
 		files = append(files, goWork, goWork+".sum")
 		data, ok, err := r.readFile(goWork)
 		if err != nil {
