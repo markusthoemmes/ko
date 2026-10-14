@@ -182,6 +182,7 @@ influence the build process.
 | `KO_GO_PATH`     | `go`                                       | `go` binary to use for builds, relative or absolute path, otherwise looked up via $PATH (optional)                                                                                                                               |
 | `KO_CONFIG_PATH` | `./.ko.yaml`                               | Path to `ko` configuration file (optional)                                                                                                                                                                                       |
 | `KOCACHE`        | (not set)                                  | This tells `ko` to store a local mapping between the `go build` inputs to the image layer that they produce, so `go build` can be skipped entirely if the layer is already present in the image registry (optional).             |
+| `KO_CLOSURE_COMMIT` | (not set)                               | Build each binary from the last commit that changed its inputs, so its VCS stamp and image digest only change when those inputs do. See [Closure-Commit Builds](./features/closure-commit.md) (optional). |
 
 ## Naming Images
 

@@ -106,6 +106,7 @@ type gobuild struct {
 	annotations          map[string]string
 	user                 string
 	debug                bool
+	closureCommit        bool
 	semaphore            *semaphore.Weighted
 
 	cache *layerCache
@@ -152,6 +153,10 @@ func (gbo *gobuildOpener) Open() (Interface, error) {
 	if gbo.annotations == nil {
 		gbo.annotations = map[string]string{}
 	}
+	closureCommit, err := closureCommitFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	return &gobuild{
 		ctx:                  gbo.ctx,
 		getBase:              gbo.getBase,
@@ -172,6 +177,7 @@ func (gbo *gobuildOpener) Open() (Interface, error) {
 		annotations:          gbo.annotations,
 		dir:                  gbo.dir,
 		debug:                gbo.debug,
+		closureCommit:        closureCommit,
 		platformMatcher:      matcher,
 		cache: &layerCache{
 			buildToDiff: map[string]buildIDToDiffID{},
@@ -1178,11 +1184,21 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 		}
 	}
 
+	dir := g.dir
+	if g.closureCommit {
+		var cleanup func()
+		dir, cleanup, err = g.closureBuildDir(ctx, ref.Path(), env, flags)
+		if err != nil {
+			return nil, fmt.Errorf("preparing closure-commit build of %s: %w", ref.Path(), err)
+		}
+		defer cleanup()
+	}
+
 	// Do the build into a temporary file.
 	file, err := g.build(ctx, buildContext{
 		creationTime: g.creationTime,
 		ip:           ref.Path(),
-		dir:          g.dir,
+		dir:          dir,
 		env:          env,
 		flags:        flags,
 		ldflags:      ldflags,
