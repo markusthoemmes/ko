@@ -51,7 +51,7 @@ func newClosureRepo(t *testing.T) (string, string) {
 	} {
 		writeRepoFile(t, root, name, content)
 	}
-	runGit(t, root, "init", "-q")
+	mustGit(t, root, "init", "-q")
 	return root, filepath.Join(root, "app")
 }
 
@@ -66,7 +66,7 @@ func writeRepoFile(t *testing.T, root, name, content string) {
 	}
 }
 
-func runGit(t *testing.T, dir string, args ...string) string {
+func mustGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-c", "user.name=ko", "-c", "user.email=ko@example.com", "-c", "commit.gpgSign=false"}, args...)...)
 	cmd.Dir = dir
@@ -79,13 +79,32 @@ func runGit(t *testing.T, dir string, args ...string) string {
 
 func commitAll(t *testing.T, root, msg string) string {
 	t.Helper()
-	runGit(t, root, "add", "-A")
-	runGit(t, root, "commit", "-q", "-m", msg)
-	return runGit(t, root, "rev-parse", "HEAD")
+	mustGit(t, root, "add", "-A")
+	mustGit(t, root, "commit", "-q", "-m", msg)
+	return mustGit(t, root, "rev-parse", "HEAD")
 }
 
 func closureTestEnv() []string {
 	return append(os.Environ(), "GOWORK=off", "GOPROXY=off", "GOFLAGS=", "CGO_ENABLED=0")
+}
+
+// closureFor resolves the app's repository and inputs.
+func closureFor(t *testing.T, app string) (repository, inputs) {
+	t.Helper()
+	dir, err := resolvedDir(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := openRepo(t.Context(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	in, err := listInputs(t.Context(), repo, dir, closureAppImportPath, closureTestEnv(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo, in
 }
 
 func TestResolveClosureFollowsInputs(t *testing.T) {
@@ -120,12 +139,13 @@ func TestResolveClosureFollowsInputs(t *testing.T) {
 				want = commit
 			}
 
-			c, err := resolveClosure(t.Context(), app, closureAppImportPath, closureTestEnv(), nil)
+			repo, in := closureFor(t, app)
+			got, err := repo.lastCommit(t.Context(), in)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if c.commit != want {
-				t.Errorf("closure commit: got = %s, want = %s", c.commit, want)
+			if got != want {
+				t.Errorf("closure commit: got = %s, want = %s", got, want)
 			}
 		})
 	}
@@ -217,11 +237,11 @@ func TestResolveClosureRejectsShallowClone(t *testing.T) {
 	commitAll(t, root, "second")
 
 	clone := t.TempDir()
-	runGit(t, clone, "clone", "-q", "--depth=1", "file://"+root, ".")
+	mustGit(t, clone, "clone", "-q", "--depth=1", "file://"+root, ".")
 
-	_, err := resolveClosure(t.Context(), filepath.Join(clone, "app"), closureAppImportPath, closureTestEnv(), nil)
+	_, err := openRepo(t.Context(), clone)
 	if err == nil || !strings.Contains(err.Error(), "shallow") {
-		t.Errorf("resolveClosure in a shallow clone: got err = %v, want a shallow clone error", err)
+		t.Errorf("openRepo on a shallow clone: got err = %v, want a shallow clone error", err)
 	}
 }
 
@@ -229,15 +249,16 @@ func TestClosureCheckoutLeavesSourceRepositoryAlone(t *testing.T) {
 	root, app := newClosureRepo(t)
 	commitAll(t, root, "initial")
 	state := func() string {
-		return runGit(t, root, "config", "--list", "--local") + "\n" + runGit(t, root, "worktree", "list")
+		return mustGit(t, root, "config", "--list", "--local") + "\n" + mustGit(t, root, "worktree", "list")
 	}
 	before := state()
 
-	c, err := resolveClosure(t.Context(), app, closureAppImportPath, closureTestEnv(), nil)
+	repo, in := closureFor(t, app)
+	commit, err := repo.lastCommit(t.Context(), in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir, cleanup, err := c.checkout(t.Context())
+	dir, cleanup, err := repo.sparseCheckout(t.Context(), commit, in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,35 +272,49 @@ func TestClosureCheckoutLeavesSourceRepositoryAlone(t *testing.T) {
 	}
 }
 
-func TestKodataFilesFollowsSymlinks(t *testing.T) {
-	// Resolve the root the way git reports it, so it compares equal to
-	// resolved symlink targets (on macOS, t.TempDir is under the /var symlink).
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeRepoFile(t, root, "shared/data.txt", "data\n")
-	writeRepoFile(t, root, "shared/dir/nested.txt", "nested\n")
-	writeRepoFile(t, root, "app/kodata/plain.txt", "plain\n")
+func TestKodataFilesFollowsSymlinksWithinRepository(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	writeRepoFile(t, outside, "secret.txt", "secret\n")
+	writeRepoFile(t, dir, "shared/data.txt", "data\n")
+	writeRepoFile(t, dir, "shared/dir/nested.txt", "nested\n")
+	writeRepoFile(t, dir, "app/kodata/plain.txt", "plain\n")
 	for link, target := range map[string]string{
-		"app/kodata/file-link": "../../shared/data.txt",
-		"app/kodata/dir-link":  "../../shared/dir",
+		"app/kodata/file-link":       "../../shared/data.txt",
+		"app/kodata/dir-link":        "../../shared/dir",
+		"app/kodata/chain":           "../../shared/hop",
+		"shared/hop":                 "data.txt",
+		"app/kodata/escape":          outside,
+		"app/kodata/escape-relative": "../../../escaped",
 	} {
-		if err := os.Symlink(target, filepath.Join(root, link)); err != nil {
+		if err := os.Symlink(target, filepath.Join(dir, link)); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	got, err := kodataFiles(root, filepath.Join(root, "app", "kodata"))
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer root.Close()
+
+	got, err := repository{dir: dir, root: root}.kodataFiles("app/kodata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(got)
+	got = slices.Compact(got)
+	// Every symlink on the way counts, and links leaving the repository are
+	// listed themselves but never followed.
 	want := []string{
+		"app/kodata/chain",
 		"app/kodata/dir-link",
+		"app/kodata/escape",
+		"app/kodata/escape-relative",
 		"app/kodata/file-link",
 		"app/kodata/plain.txt",
 		"shared/data.txt",
 		"shared/dir/nested.txt",
+		"shared/hop",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("kodataFiles: got = %v, want = %v", got, want)

@@ -16,26 +16,29 @@ package build
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+
+	"golang.org/x/mod/modfile"
+	"golang.org/x/tools/go/packages"
 )
 
-// closureCommitEnv enables closure-commit builds. ko then builds each binary
-// from a sparse checkout of the most recent commit that changed any of the
-// binary's inputs, instead of from the working tree. Go stamps that commit as
-// vcs.revision, so the binary, and with it the image, only changes when its
-// inputs do, while the stamp stays a real, clean commit.
+// closureCommitEnv enables closure-commit builds: ko builds each binary from
+// a sparse checkout of the most recent commit that changed any of its inputs.
+// Go stamps that commit as vcs.revision, so the binary, and with it the image,
+// only changes when its inputs do.
 const closureCommitEnv = "KO_CLOSURE_COMMIT"
 
 func closureCommitFromEnv() (bool, error) {
@@ -50,272 +53,383 @@ func closureCommitFromEnv() (bool, error) {
 	return enabled, nil
 }
 
-// closureInputs are the repository-relative paths, in slash form, that
-// determine a binary.
-type closureInputs struct {
-	// dirs are the directories of the binary's packages within the
-	// repository. Every file directly in them counts, regardless of build
-	// constraints.
-	dirs []string
-	// files are the embedded files and the module and workspace files.
-	files []string
-	// kodata are the files ko copies into the image, with symlinks resolved.
-	// They select the commit but stay out of the checkout, because ko reads
-	// kodata from the working tree.
-	kodata []string
+// closureBuildDir returns the directory to build ip from, and a function to
+// call once the build is done.
+func (g *gobuild) closureBuildDir(ctx context.Context, ip string, env, flags []string) (string, func(), error) {
+	dir, err := resolvedDir(g.dir)
+	if err != nil {
+		return "", nil, err
+	}
+	repo, err := openRepo(ctx, dir)
+	if err != nil {
+		return "", nil, err
+	}
+	defer repo.Close()
+	in, err := listInputs(ctx, repo, dir, ip, env, flags)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// A checkout would drop local changes, so build those from the working tree.
+	dirty, err := repo.firstChanged(ctx, in)
+	if err != nil {
+		return "", nil, err
+	}
+	if dirty != "" {
+		log.Printf("Building %s from the working tree: its inputs have local changes (%s)", ip, dirty)
+		return g.dir, func() {}, nil
+	}
+
+	commit, err := repo.lastCommit(ctx, in)
+	if err != nil {
+		return "", nil, err
+	}
+	checkout, cleanup, err := repo.sparseCheckout(ctx, commit, in)
+	if err != nil {
+		return "", nil, err
+	}
+	log.Printf("Building %s from %s, the last commit that changed its inputs", ip, commit[:12])
+	rel, _ := repo.rel(dir)
+	return filepath.Join(checkout, rel), cleanup, nil
 }
 
-func (in closureInputs) pathspecs() []string {
-	specs := make([]string, 0, len(in.dirs)+len(in.files)+len(in.kodata))
+// resolvedDir returns dir as an absolute path with symlinks resolved, the way
+// git reports the repository root, so that paths under both compare equal.
+func resolvedDir(dir string) (string, error) {
+	abs, err := filepath.Abs(cmp.Or(dir, "."))
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
+}
+
+// repository is the git repository a binary is built from. Files are read
+// through root, so paths taken from module files and symlinks cannot reach
+// outside the repository.
+type repository struct {
+	dir  string
+	root *os.Root
+}
+
+func openRepo(ctx context.Context, dir string) (repository, error) {
+	out, err := runGit(ctx, dir, "rev-parse", "--show-toplevel", "--is-shallow-repository")
+	if err != nil {
+		return repository{}, fmt.Errorf("%s requires building from a git repository: %w", closureCommitEnv, err)
+	}
+	top, shallow, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	if shallow == "true" {
+		return repository{}, fmt.Errorf("%s requires full history, but %s is a shallow clone (fetch with --unshallow, or clone with --filter=blob:none instead of --depth)", closureCommitEnv, top)
+	}
+	root, err := os.OpenRoot(top)
+	if err != nil {
+		return repository{}, err
+	}
+	return repository{dir: top, root: root}, nil
+}
+
+func (r repository) Close() error {
+	return r.root.Close()
+}
+
+// rel returns p relative to the repository root in slash form, and whether p
+// lies within the repository at all.
+func (r repository) rel(p string) (string, bool) {
+	if !withinRoot(p, r.dir) {
+		return "", false
+	}
+	rel, err := filepath.Rel(r.dir, p)
+	if err != nil {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
+}
+
+// firstChanged returns the first input with local changes, or "" if there
+// are none. Untracked and ignored files count: go builds any Go file in a
+// package directory, committed or not.
+func (r repository) firstChanged(ctx context.Context, in inputs) (string, error) {
+	out, err := runGit(ctx, r.dir, slices.Concat([]string{"status", "--porcelain", "--untracked-files=all", "--ignored=matching", "--"}, in.pathspecs())...)
+	if err != nil {
+		return "", err
+	}
+	line, _, _ := strings.Cut(out, "\n")
+	return strings.TrimSpace(line), nil
+}
+
+// lastCommit returns the most recent commit, following first parents from
+// HEAD, that changed any of the inputs.
+func (r repository) lastCommit(ctx context.Context, in inputs) (string, error) {
+	out, err := runGit(ctx, r.dir, slices.Concat([]string{"log", "-1", "--first-parent", "--format=%H", "HEAD", "--"}, in.pathspecs())...)
+	if err != nil {
+		return "", err
+	}
+	commit := strings.TrimSpace(out)
+	if commit == "" {
+		return "", errors.New("no commit changed the build's inputs")
+	}
+	return commit, nil
+}
+
+// sparseCheckout checks out just the inputs at commit into a temporary
+// repository and returns its root, along with a function that removes it.
+//
+// The checkout borrows objects from the repository through
+// objects/info/alternates, so creating it never writes to the repository.
+// Because it holds only the inputs, an input missing from the list fails the
+// build instead of compiling a stale copy. git status reports the files left
+// out as skipped rather than deleted, so Go stamps the commit as clean.
+func (r repository) sparseCheckout(ctx context.Context, commit string, in inputs) (string, func(), error) {
+	files, err := r.filesAt(ctx, commit, in)
+	if err != nil {
+		return "", nil, err
+	}
+	objects, err := runGit(ctx, r.dir, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+	if err != nil {
+		return "", nil, err
+	}
+
+	dir, err := os.MkdirTemp("", "ko-closure-")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	if err := initSparseRepo(ctx, dir, strings.TrimSpace(objects), commit, files); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("checking out %s: %w", commit, err)
+	}
+	return dir, cleanup, nil
+}
+
+// filesAt lists the files at commit that are inputs: the files directly in
+// each input directory, and the input files that exist at that commit.
+func (r repository) filesAt(ctx context.Context, commit string, in inputs) ([]string, error) {
+	paths := slices.Clone(in.files)
+	for _, d := range in.dirs {
+		paths = append(paths, d+"/") // A trailing slash lists the directory's entries.
+	}
+	out, err := runGit(ctx, r.dir, slices.Concat([]string{"ls-tree", "-z", "--full-tree", commit, "--"}, paths)...)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for entry := range strings.SplitSeq(out, "\x00") {
+		// Each entry is "<mode> <type> <object>\t<path>".
+		meta, path, _ := strings.Cut(entry, "\t")
+		if fields := strings.Fields(meta); len(fields) == 3 && fields[1] == "blob" {
+			files = append(files, path)
+		}
+	}
+	return files, nil
+}
+
+func initSparseRepo(ctx context.Context, dir, objects, commit string, files []string) error {
+	var patterns strings.Builder
+	for _, f := range files {
+		fmt.Fprintf(&patterns, "/%s\n", globEscaper.Replace(f))
+	}
+	if _, err := runGit(ctx, dir, "init", "-q"); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git", "objects", "info", "alternates"), []byte(objects+"\n"), 0o600); err != nil {
+		return err
+	}
+	if _, err := runGit(ctx, dir, "config", "core.sparseCheckout", "true"); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git", "info", "sparse-checkout"), []byte(patterns.String()), 0o600); err != nil {
+		return err
+	}
+	if _, err := runGit(ctx, dir, "update-ref", "--no-deref", "HEAD", commit); err != nil {
+		return err
+	}
+	_, err := runGit(ctx, dir, "read-tree", "-mu", "HEAD")
+	return err
+}
+
+// globEscaper escapes the characters git treats as wildcards in glob
+// pathspecs and sparse-checkout patterns.
+var globEscaper = strings.NewReplacer(`\`, `\\`, "*", `\*`, "?", `\?`, "[", `\[`)
+
+// inputs are the repository-relative paths, in slash form, that determine a
+// binary.
+type inputs struct {
+	// dirs are the binary's package directories. Every file directly in them
+	// counts, regardless of build constraints.
+	dirs []string
+	// files are embedded files, module and workspace files, and kodata.
+	files []string
+}
+
+func (in inputs) pathspecs() []string {
+	specs := make([]string, 0, len(in.dirs)+len(in.files))
 	for _, d := range in.dirs {
 		specs = append(specs, ":(top,glob)"+globEscaper.Replace(d)+"/*")
 	}
-	for _, f := range slices.Concat(in.files, in.kodata) {
+	for _, f := range in.files {
 		specs = append(specs, ":(top,literal)"+f)
 	}
 	return specs
 }
 
-// globEscaper escapes the characters that git treats as wildcards, both in
-// glob pathspecs and in sparse-checkout patterns.
-var globEscaper = strings.NewReplacer(`\`, `\\`, "*", `\*`, "?", `\?`, "[", `\[`)
-
-// closure is what a closure-commit build of one binary resolves to.
-type closure struct {
-	root   string
-	dir    string
-	commit string
-	inputs closureInputs
-	// dirty names an input with local changes. A checkout would drop them,
-	// so such a binary is built from the working tree instead.
-	dirty string
-}
-
-// resolveClosure finds the inputs of the binary at importpath ip, built in
-// dir with env and flags, and the most recent commit that changed any of them.
-func resolveClosure(ctx context.Context, dir, ip string, env, flags []string) (closure, error) {
-	if dir == "" {
-		dir = "."
-	}
-	absDir, err := filepath.Abs(dir)
+// listInputs lists the inputs within repo of the binary at ip, built in dir
+// with env and flags.
+func listInputs(ctx context.Context, repo repository, dir, ip string, env, flags []string) (inputs, error) {
+	main, err := loadPackage(ctx, dir, ip, env, flags)
 	if err != nil {
-		return closure{}, err
+		return inputs{}, err
 	}
-	// git reports the repository root with symlinks resolved, so resolve dir
-	// too, and run go there, to keep every path comparable to the root.
-	if absDir, err = filepath.EvalSymlinks(absDir); err != nil {
-		return closure{}, err
-	}
-
-	out, err := gitOutput(ctx, absDir, "rev-parse", "--show-toplevel", "--is-shallow-repository")
-	if err != nil {
-		return closure{}, fmt.Errorf("%s requires building from a git repository: %w", closureCommitEnv, err)
-	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 2 {
-		return closure{}, fmt.Errorf("unexpected output from git rev-parse: %q", out)
-	}
-	root := lines[0]
-	if lines[1] == "true" {
-		return closure{}, fmt.Errorf("%s requires full history, but %s is a shallow clone (fetch with --unshallow, or clone with --filter=blob:none instead of --depth)", closureCommitEnv, root)
-	}
-
-	inputs, err := closureInputsFor(ctx, root, absDir, ip, env, flags)
-	if err != nil {
-		return closure{}, err
-	}
-	specs := inputs.pathspecs()
-	c := closure{root: root, dir: absDir, inputs: inputs}
-
-	// Untracked and ignored files count: go builds any Go file in a package
-	// directory, committed or not.
-	out, err = gitOutput(ctx, root, append([]string{"status", "--porcelain", "--untracked-files=all", "--ignored=matching", "--"}, specs...)...)
-	if err != nil {
-		return closure{}, err
-	}
-	if line, _, _ := strings.Cut(out, "\n"); line != "" {
-		c.dirty = strings.TrimSpace(line)
-		return c, nil
-	}
-
-	out, err = gitOutput(ctx, root, append([]string{"log", "-1", "--first-parent", "--format=%H", "HEAD", "--"}, specs...)...)
-	if err != nil {
-		return closure{}, err
-	}
-	if c.commit = strings.TrimSpace(out); c.commit == "" {
-		return closure{}, fmt.Errorf("no commit changes the inputs of %s", ip)
-	}
-	return c, nil
-}
-
-// closureInputsFor lists the inputs of the binary at ip within root.
-func closureInputsFor(ctx context.Context, root, dir, ip string, env, flags []string) (closureInputs, error) {
-	var in closureInputs
-	addDir := func(p string) error {
-		rel, ok, err := relativeTo(root, p)
-		if ok {
-			in.dirs = append(in.dirs, rel)
-		}
-		return err
-	}
-	addFile := func(p string) error {
-		rel, ok, err := relativeTo(root, p)
-		if ok {
-			in.files = append(in.files, rel)
-		}
-		return err
-	}
-
-	// Flags can carry build tags, which decide what gets imported, so go list
-	// needs them as the build sees them. Only template them when they use
-	// templates: collecting the template data logs git notices the build
-	// itself logs again.
-	args := flags
-	if slices.ContainsFunc(flags, func(f string) bool { return strings.Contains(f, "{{") }) {
-		var err error
-		if args, err = createBuildArgs(ctx, buildContext{ip: ip, dir: dir, env: env, flags: flags}); err != nil {
-			return closureInputs{}, err
+	dirs, files := map[string]struct{}{}, map[string]struct{}{}
+	addFile := func(p string) {
+		if rel, ok := repo.rel(p); ok {
+			files[rel] = struct{}{}
 		}
 	}
-	out, err := goOutput(ctx, dir, env, slices.Concat([]string{"list", "-deps", "-json=ImportPath,Dir,Standard,EmbedFiles,Module"}, args, []string{ip})...)
-	if err != nil {
-		return closureInputs{}, err
-	}
-	mainDir := ""
-	for dec := json.NewDecoder(strings.NewReader(out)); ; {
-		var pkg struct {
-			ImportPath string
-			Dir        string
-			Standard   bool
-			EmbedFiles []string
-			Module     *struct{ GoMod string }
-		}
-		if err := dec.Decode(&pkg); errors.Is(err, io.EOF) {
-			break
-		} else if err != nil {
-			return closureInputs{}, fmt.Errorf("decoding go list output: %w", err)
-		}
-		if pkg.Standard {
-			continue
-		}
-		if pkg.ImportPath == ip {
-			mainDir = pkg.Dir
-		}
-		if err := addDir(pkg.Dir); err != nil {
-			return closureInputs{}, err
+	packages.Visit([]*packages.Package{main}, nil, func(pkg *packages.Package) {
+		if rel, ok := repo.rel(pkg.Dir); ok {
+			dirs[rel] = struct{}{}
 		}
 		for _, f := range pkg.EmbedFiles {
-			if err := addFile(filepath.Join(pkg.Dir, f)); err != nil {
-				return closureInputs{}, err
-			}
+			addFile(f)
 		}
-		if pkg.Module != nil && pkg.Module.GoMod != "" {
-			if err := addFile(pkg.Module.GoMod); err != nil {
-				return closureInputs{}, err
-			}
+		if pkg.Module != nil {
+			addFile(pkg.Module.GoMod)
 		}
-	}
-	if mainDir == "" {
-		return closureInputs{}, fmt.Errorf("go list did not report %s", ip)
-	}
+	})
 
-	modFiles, err := moduleFiles(ctx, dir, env)
+	mainDir, ok := repo.rel(main.Dir)
+	if !ok || main.Module == nil {
+		return inputs{}, fmt.Errorf("%s is not a package of a module in %s", ip, repo.dir)
+	}
+	modFiles, err := repo.moduleFiles(ctx, dir, env, main.Module.GoMod)
 	if err != nil {
-		return closureInputs{}, err
+		return inputs{}, err
 	}
-	for _, f := range modFiles {
-		if err := addFile(f); err != nil {
-			return closureInputs{}, err
-		}
-	}
-
-	kodata, err := kodataFiles(root, filepath.Join(mainDir, "kodata"))
+	kodata, err := repo.kodataFiles(path.Join(mainDir, "kodata"))
 	if err != nil {
-		return closureInputs{}, err
+		return inputs{}, err
 	}
-	in.kodata = kodata
-
-	slices.Sort(in.dirs)
-	in.dirs = slices.Compact(in.dirs)
-	slices.Sort(in.files)
-	in.files = slices.Compact(in.files)
-	return in, nil
+	for _, f := range slices.Concat(modFiles, kodata) {
+		files[f] = struct{}{}
+	}
+	return inputs{dirs: slices.Sorted(maps.Keys(dirs)), files: slices.Sorted(maps.Keys(files))}, nil
 }
 
-// moduleFiles lists the files that shape the module graph: the main module's
-// go.mod and go.sum, the workspace files in workspace mode, and the go.mod of
-// every local replacement. Go reads a replacement's go.mod even when the
-// build imports none of its packages.
-func moduleFiles(ctx context.Context, dir string, env []string) ([]string, error) {
-	out, err := goOutput(ctx, dir, env, "env", "-json", "GOMOD", "GOWORK")
+// loadPackage loads the main package at ip and its dependencies the way the
+// build sees them.
+func loadPackage(ctx context.Context, dir, ip string, env, flags []string) (*packages.Package, error) {
+	// Flags can carry build tags, which decide what gets imported. Only
+	// template them when they use templates: gathering the template data
+	// logs git notices that the build logs again.
+	if slices.ContainsFunc(flags, func(f string) bool { return strings.Contains(f, "{{") }) {
+		var err error
+		if flags, err = createBuildArgs(ctx, buildContext{ip: ip, dir: dir, env: env, flags: flags}); err != nil {
+			return nil, err
+		}
+	}
+	pkgs, err := packages.Load(&packages.Config{
+		Context:    ctx,
+		Dir:        dir,
+		Env:        env,
+		BuildFlags: flags,
+		Mode:       packages.NeedName | packages.NeedFiles | packages.NeedEmbedFiles | packages.NeedImports | packages.NeedDeps | packages.NeedModule,
+	}, ip)
 	if err != nil {
 		return nil, err
 	}
-	var goEnv struct{ GOMOD, GOWORK string }
-	if err := json.Unmarshal([]byte(out), &goEnv); err != nil {
-		return nil, fmt.Errorf("decoding go env output: %w", err)
+	if len(pkgs) != 1 {
+		return nil, fmt.Errorf("found %d packages for %s, expected 1", len(pkgs), ip)
 	}
+	var errs []error
+	packages.Visit(pkgs, nil, func(pkg *packages.Package) {
+		for _, e := range pkg.Errors {
+			errs = append(errs, e)
+		}
+	})
+	return pkgs[0], errors.Join(errs...)
+}
 
-	var files, goMods []string
-	if goEnv.GOMOD != "" && goEnv.GOMOD != os.DevNull {
-		goMods = append(goMods, goEnv.GOMOD)
-		files = append(files, goEnv.GOMOD, filepath.Join(filepath.Dir(goEnv.GOMOD), "go.sum"))
+// moduleFiles lists, relative to the repository, the files that shape the
+// module graph: the main module's go.mod and go.sum, go.work and go.work.sum
+// and the used modules' go.mod and go.sum in workspace mode, and the go.mod of
+// every local replacement, which go reads even when the build imports none of
+// its packages. Files outside the repository cannot be inputs.
+func (r repository) moduleFiles(ctx context.Context, dir string, env []string, mainGoMod string) ([]string, error) {
+	goMods := []string{mainGoMod}
+	var files []string
+
+	// The go command decides whether, and which, workspace applies.
+	out, err := runGo(ctx, dir, env, "env", "GOWORK")
+	if err != nil {
+		return nil, err
 	}
-	if goEnv.GOWORK != "" && goEnv.GOWORK != "off" {
-		files = append(files, goEnv.GOWORK, goEnv.GOWORK+".sum")
-		out, err := goOutput(ctx, dir, env, "work", "edit", "-json", goEnv.GOWORK)
+	if goWork := strings.TrimSpace(out); goWork != "" && goWork != "off" {
+		files = append(files, goWork, goWork+".sum")
+		data, ok, err := r.readFile(goWork)
 		if err != nil {
 			return nil, err
 		}
-		var work struct {
-			Use     []struct{ DiskPath string }
-			Replace []moduleReplace
+		if ok {
+			work, err := modfile.ParseWork(goWork, data, nil)
+			if err != nil {
+				return nil, err
+			}
+			workDir := filepath.Dir(goWork)
+			for _, use := range work.Use {
+				goMods = append(goMods, filepath.Join(resolvePath(workDir, use.Path), "go.mod"))
+			}
+			files = append(files, localReplacements(workDir, work.Replace)...)
 		}
-		if err := json.Unmarshal([]byte(out), &work); err != nil {
-			return nil, fmt.Errorf("decoding go work edit output: %w", err)
-		}
-		workDir := filepath.Dir(goEnv.GOWORK)
-		for _, use := range work.Use {
-			modDir := resolvePath(workDir, use.DiskPath)
-			goMods = append(goMods, filepath.Join(modDir, "go.mod"))
-			files = append(files, filepath.Join(modDir, "go.mod"), filepath.Join(modDir, "go.sum"))
-		}
-		files = append(files, localReplacements(workDir, work.Replace)...)
 	}
 
 	for _, goMod := range goMods {
-		out, err := goOutput(ctx, dir, env, "mod", "edit", "-json", goMod)
+		modDir := filepath.Dir(goMod)
+		files = append(files, goMod, filepath.Join(modDir, "go.sum"))
+		data, ok, err := r.readFile(goMod)
 		if err != nil {
 			return nil, err
 		}
-		var mod struct{ Replace []moduleReplace }
-		if err := json.Unmarshal([]byte(out), &mod); err != nil {
-			return nil, fmt.Errorf("decoding go mod edit output: %w", err)
+		if ok {
+			mod, err := modfile.Parse(goMod, data, nil)
+			if err != nil {
+				return nil, err
+			}
+			files = append(files, localReplacements(modDir, mod.Replace)...)
 		}
-		files = append(files, localReplacements(filepath.Dir(goMod), mod.Replace)...)
 	}
 
-	// Not every module has a go.sum.
-	return slices.DeleteFunc(files, func(f string) bool {
-		_, err := os.Stat(f)
-		return err != nil
-	}), nil
+	var rels []string
+	for _, f := range files {
+		// Not every module has a go.sum.
+		if rel, ok := r.rel(f); ok {
+			if _, err := r.root.Stat(filepath.FromSlash(rel)); err == nil {
+				rels = append(rels, rel)
+			}
+		}
+	}
+	return rels, nil
 }
 
-type moduleReplace struct {
-	New struct{ Path, Version string }
+// readFile reads the file at the absolute path p, and reports whether p lies
+// within the repository at all.
+func (r repository) readFile(p string) ([]byte, bool, error) {
+	rel, ok := r.rel(p)
+	if !ok {
+		return nil, false, nil
+	}
+	data, err := r.root.ReadFile(filepath.FromSlash(rel))
+	return data, true, err
 }
 
-// localReplacements returns the go.mod files of the replacements that point at
-// directories, resolved against base.
-func localReplacements(base string, replaces []moduleReplace) []string {
-	var files []string
-	for _, r := range replaces {
+// localReplacements returns the go.mod files of the replacements that point
+// at directories, resolved against base.
+func localReplacements(base string, replacements []*modfile.Replace) []string {
+	var goMods []string
+	for _, r := range replacements {
 		if r.New.Version == "" {
-			files = append(files, filepath.Join(resolvePath(base, r.New.Path), "go.mod"))
+			goMods = append(goMods, filepath.Join(resolvePath(base, r.New.Path), "go.mod"))
 		}
 	}
-	return files
+	return goMods
 }
 
 func resolvePath(base, p string) string {
@@ -325,175 +439,87 @@ func resolvePath(base, p string) string {
 	return filepath.Join(base, p)
 }
 
-// kodataFiles lists the files under kodataDir within root, following symlinks
-// the way ko does when it copies kodata into the image. It lists both a
-// symlink and its target, since changing either changes the image.
-func kodataFiles(root, kodataDir string) ([]string, error) {
+// kodataFiles lists, relative to the repository, the files under the
+// repository-relative directory dir, following symlinks the way ko does when it
+// copies kodata into the image. Every symlink on the way counts, since changing
+// any of them changes the image. Symlinks leaving the repository are not
+// inputs, and ko rejects them when it builds the image anyway.
+func (r repository) kodataFiles(dir string) ([]string, error) {
 	var files []string
-	add := func(p string) error {
-		rel, ok, err := relativeTo(root, p)
-		if ok {
-			files = append(files, rel)
+	err := fs.WalkDir(r.root.FS(), dir, func(p string, d fs.DirEntry, err error) error {
+		switch {
+		case errors.Is(err, fs.ErrNotExist) && p == dir:
+			return nil // There is no kodata.
+		case err != nil || d.IsDir():
+			return err
 		}
-		return err
-	}
-	visited := map[string]struct{}{}
-	var walk func(dir string) error
-	walk = func(dir string) error {
-		if _, ok := visited[dir]; ok {
+		target, links, err := r.followLinks(p)
+		files = append(files, links...)
+		if err != nil || target == "" {
+			return err
+		}
+		info, err := r.root.Stat(filepath.FromSlash(target))
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			files = append(files, target)
 			return nil
 		}
-		visited[dir] = struct{}{}
-		return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-			switch {
-			case errors.Is(err, fs.ErrNotExist) && p == kodataDir:
-				return nil // The binary has no kodata.
-			case err != nil || d.IsDir():
-				return err
-			}
-			if err := add(p); err != nil || d.Type()&fs.ModeSymlink == 0 {
-				return err
-			}
-			target, err := filepath.EvalSymlinks(p)
-			if err != nil {
-				return err
-			}
-			info, err := os.Stat(target)
-			if err != nil {
-				return err
-			}
-			if info.IsDir() {
-				return walk(target)
-			}
-			return add(target)
-		})
+		nested, err := r.kodataFiles(target)
+		files = append(files, nested...)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing kodata in %s: %w", dir, err)
 	}
-	if err := walk(kodataDir); err != nil {
-		return nil, fmt.Errorf("listing kodata in %s: %w", kodataDir, err)
-	}
-	slices.Sort(files)
-	return slices.Compact(files), nil
+	return files, nil
 }
 
-// relativeTo returns p relative to root in slash form, and whether p lies
-// within root at all. Paths outside the repository, such as the module cache,
-// are not inputs git can track.
-func relativeTo(root, p string) (string, bool, error) {
-	if !withinRoot(p, root) {
-		return "", false, nil
-	}
-	rel, err := filepath.Rel(root, p)
-	if err != nil {
-		return "", false, err
-	}
-	return filepath.ToSlash(rel), true, nil
-}
-
-// checkout materializes the inputs at the closure commit in a temporary
-// repository and returns the directory to build from, along with a function
-// that removes the checkout.
-//
-// The checkout is its own repository that borrows objects from the source
-// repository through objects/info/alternates, so preparing it never writes to
-// the source repository. It is sparse: it holds only the inputs the go
-// command reads, so an input missing from the closure fails the build instead
-// of compiling a stale copy. git status reports the files outside the sparse
-// set as skipped rather than modified, so Go stamps the commit as clean.
-func (c closure) checkout(ctx context.Context) (string, func(), error) {
-	out, err := gitOutput(ctx, c.root, append([]string{"ls-tree", "-z", "--full-tree", c.commit, "--"}, c.sparsePaths()...)...)
-	if err != nil {
-		return "", nil, err
-	}
-	var patterns strings.Builder
-	for entry := range strings.SplitSeq(out, "\x00") {
-		meta, p, ok := strings.Cut(entry, "\t")
-		if fields := strings.Fields(meta); ok && len(fields) == 3 && fields[1] == "blob" {
-			fmt.Fprintf(&patterns, "/%s\n", globEscaper.Replace(p))
+// followLinks resolves the repository-relative path p one symlink at a time.
+// It returns where p ends up, or "" if a symlink leaves the repository, and
+// every symlink on the way.
+func (r repository) followLinks(p string) (string, []string, error) {
+	var links []string
+	for range 40 { // POSIX guarantees at least this many levels.
+		info, err := r.root.Lstat(filepath.FromSlash(p))
+		if err != nil || info.Mode()&fs.ModeSymlink == 0 {
+			return p, links, err
+		}
+		links = append(links, p)
+		target, err := r.root.Readlink(filepath.FromSlash(p))
+		if err != nil {
+			return "", links, err
+		}
+		if filepath.IsAbs(target) {
+			rel, ok := r.rel(target)
+			if !ok {
+				return "", links, nil
+			}
+			p = rel
+		} else if p = path.Join(path.Dir(p), filepath.ToSlash(target)); !fs.ValidPath(p) {
+			return "", links, nil
 		}
 	}
-
-	commonDir, err := gitOutput(ctx, c.root, "rev-parse", "--path-format=absolute", "--git-common-dir")
-	if err != nil {
-		return "", nil, err
-	}
-
-	tmp, err := os.MkdirTemp("", "ko-closure-")
-	if err != nil {
-		return "", nil, err
-	}
-	cleanup := func() { _ = os.RemoveAll(tmp) }
-	steps := []func() error{
-		func() error { _, err := gitOutput(ctx, tmp, "init", "-q"); return err },
-		func() error {
-			return os.WriteFile(filepath.Join(tmp, ".git", "objects", "info", "alternates"), []byte(filepath.Join(strings.TrimSpace(commonDir), "objects")+"\n"), 0o600)
-		},
-		func() error { _, err := gitOutput(ctx, tmp, "config", "core.sparseCheckout", "true"); return err },
-		func() error {
-			return os.WriteFile(filepath.Join(tmp, ".git", "info", "sparse-checkout"), []byte(patterns.String()), 0o600)
-		},
-		func() error { _, err := gitOutput(ctx, tmp, "update-ref", "--no-deref", "HEAD", c.commit); return err },
-		func() error { _, err := gitOutput(ctx, tmp, "read-tree", "-mu", "HEAD"); return err },
-	}
-	for _, step := range steps {
-		if err := step(); err != nil {
-			cleanup()
-			return "", nil, fmt.Errorf("checking out %s: %w", c.commit, err)
-		}
-	}
-
-	rel, err := filepath.Rel(c.root, c.dir)
-	if err != nil {
-		cleanup()
-		return "", nil, err
-	}
-	return filepath.Join(tmp, rel), cleanup, nil
+	return "", links, fmt.Errorf("%s: too many levels of symbolic links", links[0])
 }
 
-// sparsePaths lists the inputs the go command reads, as git ls-tree paths: a
-// trailing slash lists a directory's entries without recursing.
-func (c closure) sparsePaths() []string {
-	paths := make([]string, 0, len(c.inputs.dirs)+len(c.inputs.files))
-	for _, d := range c.inputs.dirs {
-		paths = append(paths, d+"/")
-	}
-	return append(paths, c.inputs.files...)
-}
-
-// closureBuildDir returns the directory to build ip from when closure-commit
-// builds are enabled, and a function to call once the build is done.
-func (g *gobuild) closureBuildDir(ctx context.Context, ip string, env, flags []string) (string, func(), error) {
-	c, err := resolveClosure(ctx, g.dir, ip, env, flags)
-	if err != nil {
-		return "", nil, err
-	}
-	if c.dirty != "" {
-		log.Printf("Building %s from the working tree: its inputs have local changes (%s)", ip, c.dirty)
-		return g.dir, func() {}, nil
-	}
-	dir, cleanup, err := c.checkout(ctx)
-	if err != nil {
-		return "", nil, err
-	}
-	log.Printf("Building %s from %s, the last commit that changed its inputs", ip, c.commit[:12])
-	return dir, cleanup, nil
-}
-
-func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
+func runGit(ctx context.Context, dir string, args ...string) (string, error) {
 	/* #nosec G204 -- ko invokes git with arguments it derives from the build. */
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "log.showSignature=false"}, args...)...)
 	cmd.Dir = dir
-	return runOutput(cmd)
+	return output(cmd)
 }
 
-func goOutput(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+func runGo(ctx context.Context, dir string, env []string, args ...string) (string, error) {
 	/* #nosec G204 G702 -- ko intentionally invokes the user-configured go toolchain. */
 	cmd := exec.CommandContext(ctx, getGoBinary(), args...)
 	cmd.Dir = dir
 	cmd.Env = env
-	return runOutput(cmd)
+	return output(cmd)
 }
 
-func runOutput(cmd *exec.Cmd) (string, error) {
+func output(cmd *exec.Cmd) (string, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
